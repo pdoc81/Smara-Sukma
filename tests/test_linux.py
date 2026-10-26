@@ -29,12 +29,16 @@ MTOOLS_ENV = dict(os.environ, MTOOLS_SKIP_CHECK='1')
 
 
 def mtools(*args):
-    subprocess.run(list(args), check=True, capture_output=True, env=MTOOLS_ENV)
+    res = subprocess.run(list(args), capture_output=True, text=True, env=MTOOLS_ENV)
+    if res.returncode:
+        raise RuntimeError(f'{" ".join(args)} failed: {res.stdout}{res.stderr}')
 
 
 @unittest.skipUnless(IS_LINUX and have('mkfs.vfat', 'mcopy', 'sfdisk'), 'needs dosfstools, mtools, sfdisk')
 class LinuxFatImageTests(RecoveryTest):
-    def fat_image(self, bits, size_kb=131072, cluster_sectors=8):
+    def fat_image(self, bits, size_kb=307200, cluster_sectors=8):
+        # 300 MB keeps 4 KB-cluster FAT32 above the official 65,525-cluster minimum,
+        # which older mtools insists on. The image file is sparse, so it costs little.
         img = self.path(f'fat{bits}.img')
         sh(['mkfs.vfat', '-F', str(bits), '-s', str(cluster_sectors), '-C', img, str(size_kb)])
         return img, img

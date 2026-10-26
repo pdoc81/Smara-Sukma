@@ -8,7 +8,8 @@ import unittest
 
 from helpers import IS_WIN, RecoveryTest, fixtures, run_tool, smara_sukma
 
-FOLDER = 'DCIM/Holiday Trip'
+# Long folder names: FAT loses the first letter of a deleted 8.3 name such as DCIM.
+FOLDER = 'Camera Roll/Holiday Trip'
 
 
 def diskpart(script, check=True):
@@ -56,7 +57,7 @@ class WindowsDriveTests(RecoveryTest):
         for path in fixtures().values():
             shutil.copyfile(path, os.path.join(folder, os.path.basename(path)))
         powershell(f'Write-VolumeCache -DriveLetter {letter}')
-        shutil.rmtree(os.path.join(root, 'DCIM'))
+        shutil.rmtree(os.path.join(root, FOLDER.split('/')[0]))
         powershell(f'Write-VolumeCache -DriveLetter {letter}')
         disk = int(powershell(f"(Get-DiskImage -ImagePath '{vhd}' | Get-Disk).Number"))
         return letter, disk
