@@ -818,7 +818,12 @@ class FAT(FS):
         self.ncl = (self.vol_len - self.data_off) // self.cs
         if self.ncl <= 0:
             raise ValueError('not FAT')
-        self.bits = 12 if self.ncl < 4085 else 16 if self.ncl < 65525 else 32
+        # A zero 16-bit FAT size means the FAT32 layout, whatever the cluster count
+        # (the same rule Linux uses); otherwise the cluster count decides.
+        if u16(bs, 22) == 0:
+            self.bits = 32
+        else:
+            self.bits = 12 if self.ncl < 4085 else 16
         self.name = f'FAT{self.bits}'
         self.root_cl = u32(bs, 44) if self.bits == 32 else 0
         raw = src.read(self.fat_off, min(fatsz * bps, (self.ncl + 2) * 4 + 8))
@@ -831,7 +836,9 @@ class FAT(FS):
             if sys.byteorder == 'big':
                 self.fat.byteswap()
         self.eoc = {12: 0xFF8, 16: 0xFFF8, 32: 0x0FFFFFF8}[self.bits]
-        self.seen_dirs = set()
+        self.seen_dirs = set()  # first clusters of folders already walked
+        self.dir_clusters = set()  # clusters already read as deleted-folder entries
+        self.dangling = []  # (long-name parts cut off at a cluster end, folder path)
 
     def entry(self, c):
         if self.bits == 12:
@@ -898,19 +905,38 @@ class FAT(FS):
             first = self.root_cl
         if not deleted:
             return self.read_clusters(self.chain(first, 256 * MB // self.cs))
-        # A deleted folder's FAT chain is gone: read following clusters while
-        # they still look like directory entries.
         if not self._is_dir_cluster(first):
             return b''
+        return self._read_loose_dir(first)
+
+    def _read_loose_dir(self, first):
+        """A deleted folder's FAT chain is gone: read following clusters while
+        they are free and still look like directory entries."""
         out = bytearray()
         for c in range(first, min(first + 256, self.first_cl + self.ncl)):
-            if out and self._alloc(c):
+            if out and (self._alloc(c) or c in self.dir_clusters):
                 break
             blk = self.src.read(self.coff(c), self.cs)
             if out and not self._looks_like_dir(blk):
                 break
+            self.dir_clusters.add(c)
             out += blk
         return bytes(out)
+
+    def _is_dir_fragment(self, blk):
+        """Free cluster holding the later part of a folder's entry list: every
+        entry is plausible and it contains long-name entries."""
+        if not self._looks_like_dir(blk) or blk[:11] in (b'.          ', b'..         '):
+            return False
+        lfn = 0
+        for i in range(0, len(blk) - 31, 32):
+            if blk[i] == 0:
+                break
+            if blk[i + 11] == 0x0F:
+                if blk[i + 12] != 0 or blk[i + 26:i + 28] != b'\0\0':
+                    return False
+                lfn += 1
+        return lfn >= 2
 
     @staticmethod
     def _sfn_name(sfn, case, deleted):
@@ -940,11 +966,14 @@ class FAT(FS):
         name = raw.decode('utf-16le', 'replace').split('\0')[0].replace('￿', '')
         return name or None
 
-    def parse_dir(self, data):
-        lfn = []
+    def parse_dir(self, data, lead=None, tail=None):
+        """Yield entries. `lead` is long-name parts carried over from the end of
+        another cluster; long-name parts left dangling at the end go into `tail`."""
+        lfn = list(lead or [])
         for i in range(0, len(data) - 31, 32):
             e = data[i:i + 32]
             if e[0] == 0:
+                lfn = []
                 break
             attr = e[11]
             if attr == 0x0F:
@@ -965,6 +994,8 @@ class FAT(FS):
                 'size': u32(e, 28),
                 'mtime': fat_time(u16(e, 24), u16(e, 22)),
             }
+        if tail is not None:
+            tail.extend(lfn)
 
     def _guess_high(self, first, test):
         """Some systems zero the high 16 bits of a deleted FAT32 file's start
@@ -981,7 +1012,18 @@ class FAT(FS):
         elif depth > 64 or first in seen or not self.valid(first):
             return
         seen.add(first)
-        for e in self.parse_dir(self.read_dir(first, deleted)):
+        yield from self._walk_data(self.read_dir(first, deleted), path, deleted, seen, depth)
+
+    def _walk_data(self, data, path, deleted, seen, depth, lead=None):
+        tail = []
+        yield from self._walk_entries(self.parse_dir(data, lead, tail), path, deleted, seen, depth)
+        if deleted and tail:
+            # The folder's entry list continues in another cluster we can't follow
+            # yet; remember the half-finished name so a fragment can claim it.
+            self.dangling.append((tail, path))
+
+    def _walk_entries(self, entries, path, deleted, seen, depth):
+        for e in entries:
             gone = deleted or e['deleted']
             p = f'{path}/{e["name"]}'
             if e['is_dir']:
@@ -995,9 +1037,40 @@ class FAT(FS):
     def orphan_files(self, c, want):
         """Deleted files inside a free folder cluster the tree walk never reached
         (its parent folder's entry was overwritten)."""
-        if c in self.seen_dirs or not self.valid(c) or self._alloc(c) or not self._is_dir_cluster(c):
+        if c in self.seen_dirs or c in self.dir_clusters or not self.valid(c) or self._alloc(c) \
+                or not self._is_dir_cluster(c):
             return iter(())
         return self._deleted(self.walk(c, f'/_orphaned_folders/folder_{c}', True, self.seen_dirs, 1), want)
+
+    def fragment_files(self, c, want):
+        """Deleted files listed in a free cluster that continues a folder's entry
+        list elsewhere on disk (folders that grew get their next cluster wherever
+        there was space, and that link is lost on delete). Names survive, the
+        folder they belonged to does not."""
+        if c in self.dir_clusters or c in self.seen_dirs or not self.valid(c) or self._alloc(c) \
+                or not self._is_dir_fragment(self.src.read(self.coff(c), self.cs)):
+            return iter(())
+        data = self._read_loose_dir(c)
+        lead, path = self._claim_dangling(data)
+        path = path or f'/_orphaned_folders/part_{c}'
+        return self._deleted(self._walk_data(data, path, True, self.seen_dirs, 1, lead), want)
+
+    def _claim_dangling(self, data):
+        """If this fragment starts with a short entry whose long name was cut off at
+        the end of a folder we already read, rejoin them (the long-name checksum
+        ties the two halves together) and return (long-name parts, folder path)."""
+        if len(data) < 32 or data[11] == 0x0F or data[0] != 0xE5:
+            return None, None
+        rest = data[1:11]
+        for k, (parts, path) in enumerate(self.dangling):
+            name = self._lfn_name(parts, data[:11], True)
+            if not name:
+                continue
+            first = name.lstrip(' .')[:1].upper().encode('cp437', 'replace')
+            if first and lfn_checksum(first + rest) == parts[0][1]:
+                del self.dangling[k]
+                return parts, path
+        return None, None
 
     def deleted_files(self, want):
         return self._deleted(self.walk(), want)
@@ -1481,10 +1554,13 @@ class Dedupe:
         if key in self.seen:
             self.saved_bytes += size
             return self.seen[key]
+        self.record(key, rel)
+        return None
+
+    def record(self, key, rel):
         self.seen[key] = rel
         with open(self.file, 'a', encoding='utf-8') as f:
-            f.write(f'{size} {digest} {rel}\n')
-        return None
+            f.write(f'{key[0]} {key[1]} {rel}\n')
 
 
 def unique_path(path):
@@ -1524,6 +1600,16 @@ def restore_file(src, f, out, report, dedupe, known, quiet=False):
     if good and first is not None:
         known[first] = size
     dup = dedupe.check(size, digest, rel)
+    if dup and dup.replace(os.sep, '/').startswith('carved/'):
+        # The scan already saved this file under a generic name; keep the named copy instead.
+        try:
+            os.remove(fs_path(os.path.join(out, dup)))
+        except OSError:
+            pass
+        dedupe.saved_bytes -= size
+        dedupe.record((size, digest), rel)
+        report.add('carve', 'replaced', ext, size, dup, f'by named copy {rel}')
+        dup = None
     if dup:
         os.remove(fs_path(dest))
         status, rel = 'duplicate', f'same as {dup}'
@@ -1549,8 +1635,10 @@ def undelete(src, fs, out, report, dedupe, want):
     return known
 
 
-# A FAT folder's first cluster starts with its "." entry.
+# A FAT folder's first cluster starts with its "." entry; long-name entries carry
+# attribute 0x0F followed by a zero byte.
 FAT_DIR_PATTERN = re.compile(rb'\.          \x10')
+FAT_LFN_PATTERN = re.compile(rb'\x0f\x00')
 
 
 def carve(src, fs, out, report, dedupe, want, align, include_allocated, resume):
@@ -1592,6 +1680,16 @@ def carve(src, fs, out, report, dedupe, want, align, include_allocated, resume):
                 s = pos + m.start()
                 if s >= fs.data_off and (s - fs.data_off) % fs.cs == 0:
                     for f in fs.orphan_files(fs.cluster_at(s), want):
+                        orphaned += restore_file(src, f, out, report, dedupe, known, quiet=True)
+            checked = set()
+            for m in FAT_LFN_PATTERN.finditer(buf, 0, n):
+                s = pos + m.start() - 11  # start of the 32-byte entry
+                if s < fs.data_off or (s - fs.data_off) % 32:
+                    continue
+                c = fs.cluster_at(s)
+                if c not in checked:
+                    checked.add(c)
+                    for f in fs.fragment_files(c, want):
                         orphaned += restore_file(src, f, out, report, dedupe, known, quiet=True)
         for m in PATTERN.finditer(buf):
             tag = m.group()
