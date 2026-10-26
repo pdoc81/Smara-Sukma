@@ -1,5 +1,7 @@
 # Smara Sukma
 
+[![Tests](https://github.com/pdoc81/Smara-Sukma/actions/workflows/tests.yml/badge.svg)](https://github.com/pdoc81/Smara-Sukma/actions/workflows/tests.yml)
+
 *Malay from Sanskrit: **smara** means "memory" (the root of *asmara*), and **sukma** means "soul" (from *sūkṣma*). Bringing back what was lost.*
 
 Read-only recovery of deleted photos and videos from USB drives, SD cards and external disks.
@@ -66,6 +68,22 @@ Identical copies of the same file are saved only once (`--keep-duplicates` keeps
 - **SSDs:** after a format, or once the drive has erased (TRIM) deleted space, the data is gone and no tool can recover it.
 - **A Mac's internal drive** can't be recovered this way, because it's always encrypted.
 - **Windows support** was checked with simulated Windows calls only; it hasn't been run on a real Windows PC yet.
+
+## Tests
+Every change is tested automatically on GitHub, on real Ubuntu, macOS and Windows machines:
+- **Ubuntu:** FAT drives deleted the way Windows does, plus NTFS and exFAT on real block devices.
+- **macOS:** exFAT and FAT32 disk images, plus raw disk access.
+- **Windows:** virtual hard disks formatted NTFS, FAT32 and exFAT, read by drive letter and by physical disk.
+
+Each test deletes photos and videos from a drive, runs the tool, and checks that every file comes back byte for byte with its name and folder.
+
+To run the tests yourself:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests that need admin rights or tools you don't have are skipped.
 
 ## License
 MIT. See [LICENSE](LICENSE).
